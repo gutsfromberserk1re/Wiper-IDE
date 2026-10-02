@@ -4,7 +4,9 @@ Is an IDE for **python**
 
 **visuals** 
 
-![Wiper IDE Screenshot](visual.png)
+<p align="center">
+  <img src="visual.png" alt="Wiper IDE Screenshot" width="70%" style="border-radius: 12px;">
+</p>
 
 features 
 - simple 

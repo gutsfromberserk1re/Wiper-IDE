@@ -4,8 +4,7 @@ Is an IDE for **python**
 
 **visuals** 
 
-
-
+![Wiper IDE Screenshot](visual.png)
 
 features 
 - simple 

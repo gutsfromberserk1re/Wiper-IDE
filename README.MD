@@ -15,7 +15,7 @@ Is an IDE for **python**
 
 
 
-**visuals** 
+# **visuals** 
 
 <p align="center">
   <img src="visual.png" alt="Wiper IDE Screenshot" width="70%" style="border-radius: 25px;">

@@ -5,7 +5,7 @@ on:
     branches: [ "main", "master" ]
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -31,7 +31,7 @@ jobs:
       with:
         nuitka-version: 'main'
         script-name: IDE.py
-        onefile: true
+        mode: app
         enable-plugins: pyside6
         windows-disable-console: true
         windows-icon-from-ico: snake.ico

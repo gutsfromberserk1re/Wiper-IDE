@@ -1,8 +1,8 @@
-#Wiper IDE
+# Wiper IDE
 or White Viper 
 Is an IDE for **python** 
 
-#Download
+# Download
 
 <p align="center">
   <a href="https://github.com/gutsfromberserk1re/Wiper-IDE/releases/latest">

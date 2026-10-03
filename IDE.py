@@ -5,11 +5,15 @@ import tempfile
 import ast
 import re
 import keyword
+import builtins
 import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QProcess, QProcessEnvironment, QTimer, Signal
+from PySide6.QtCore import (
+    Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QProcess, QProcessEnvironment,
+    QTimer, Signal
+)
 from PySide6.QtGui import (
     QPainter, QPainterPath, QColor, QPen, QFont, QFontDatabase, QKeySequence, QAction,
     QIcon, QCursor, QTextCursor, QTextFormat, QPolygonF, QSyntaxHighlighter, QTextCharFormat
@@ -17,7 +21,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPlainTextEdit, QTextEdit, QLabel, QPushButton, QAbstractButton, QMenu,
-    QFileDialog, QMessageBox, QTabBar, QStackedWidget
+    QFileDialog, QTabBar, QStackedWidget, QDialog
 )
 
 IS_WIN = sys.platform == "win32"
@@ -64,6 +68,29 @@ CURSOR_COLOR = "#E5E9F0"      # cursor core (silver / platinum)
 GLOW_COLOR = "#B8C2D0"        # soft silver halo around it
 CURSOR_WIDTH = 4                  # thickness in px (legacy-CLI chunky)
 CODE_FONT = "Consolas"            # replaced at startup by JetBrains Mono if found
+
+# ---------------------------------------------------------------------------
+# EDITOR BEHAVIOUR
+# ---------------------------------------------------------------------------
+PAIRS = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
+CLOSERS = set(")]}\"'")
+STRING_PREFIX_RE = re.compile(r"(?<!\w)[rRbBfFuU]{1,2}$")   # f"..", rb'..' etc.
+GHOST_MIN_CHARS = 2               # faded suggestion appears after this many typed characters
+GHOST_COLOR = QColor(171, 178, 191, 85)   # faded suggestion text (r, g, b, alpha)
+GHOST_TAIL_CHARS = set(")]}'\",: ")      # text after the cursor that may be shifted aside
+
+# Used for "Run" on unsaved buffers: makes __file__, sys.path, argv and tracebacks
+# behave as if the real file was run.
+BOOTSTRAP = '''import sys, os, linecache
+src_file, real = sys.argv[1], sys.argv[2]
+with open(src_file, encoding="utf-8") as f:
+    source = f.read()
+sys.argv = [real] + sys.argv[3:]
+sys.path[0] = os.path.dirname(real)
+linecache.cache[real] = (len(source), None, source.splitlines(True), real)
+g = {"__name__": "__main__", "__file__": real, "__builtins__": __builtins__}
+exec(compile(source, real, "exec"), g)
+'''
 
 
 def load_fonts() -> str:
@@ -169,9 +196,12 @@ class PythonHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
         super().__init__(document)
         self.f_string = _fmt("#98C379")
+        self.f_comment = _fmt("#5C6370", italic=True)
         kw = "|".join(k for k in keyword.kwlist if k not in ("True", "False", "None"))
 
-        self.rules = [  # (regex, format, group) - later rules override earlier ones
+        # Code rules only. Strings and comments are found by the scanner below,
+        # which is applied last so a '#' inside a string stays a string.
+        self.rules = [
             (r"\b[A-Za-z_]\w*(?=\()",                   _fmt("#61AFEF"), 0),
             (rf"\b(?:{kw})\b",                          _fmt("#C678DD", bold=True), 0),
             (r"\b(?:True|False|None)\b",                _fmt("#D19A66", bold=True), 0),
@@ -182,9 +212,6 @@ class PythonHighlighter(QSyntaxHighlighter):
             (r"@\w+(?:\.\w+)*",                         _fmt("#E5C07B"), 0),
             (r"\bdef\s+(\w+)",                          _fmt("#61AFEF", bold=True), 1),
             (r"\bclass\s+(\w+)",                        _fmt("#E5C07B", bold=True), 1),
-            (r'"(?:\\.|[^"\\])*"',                      self.f_string, 0),
-            (r"'(?:\\.|[^'\\])*'",                      self.f_string, 0),
-            (r"#.*",                                    _fmt("#5C6370", italic=True), 0),
         ]
         self.rules = [(re.compile(p), f, g) for p, f, g in self.rules]
 
@@ -193,35 +220,48 @@ class PythonHighlighter(QSyntaxHighlighter):
             for m in pattern.finditer(text):
                 self.setFormat(m.start(group), m.end(group) - m.start(group), fmt)
 
-        delims = {1: "'''", 2: '"""'}      # multi-line strings: state 1 = ''' , 2 = """
+        # Small scanner: strings, triple-quoted strings (state 1 = ''' , 2 = """), comments.
+        # State is carried across lines through the block state.
+        delims = {1: "'''", 2: '"""'}
         state = self.previousBlockState()
         if state not in (1, 2):
             state = 0
-        pos = 0
-        while pos < len(text):
+        n, i = len(text), 0
+        while i < n:
             if state:
-                end = text.find(delims[state], pos)
+                end = text.find(delims[state], i)
                 if end == -1:
-                    self.setFormat(pos, len(text) - pos, self.f_string)
+                    self.setFormat(i, n - i, self.f_string)
                     self.setCurrentBlockState(state)
                     return
-                self.setFormat(pos, end + 3 - pos, self.f_string)
-                pos = end + 3
-                state = 0
-            else:
-                a, b = text.find("'''", pos), text.find('"""', pos)
-                found = [(i, s) for i, s in ((a, 1), (b, 2)) if i != -1]
-                if not found:
-                    break
-                start, state = min(found)
-                end = text.find(delims[state], start + 3)
-                if end == -1:
-                    self.setFormat(start, len(text) - start, self.f_string)
-                    self.setCurrentBlockState(state)
-                    return
-                self.setFormat(start, end + 3 - start, self.f_string)
-                pos = end + 3
-                state = 0
+                self.setFormat(i, end + 3 - i, self.f_string)
+                i, state = end + 3, 0
+                continue
+            ch = text[i]
+            if ch == "#":
+                self.setFormat(i, n - i, self.f_comment)
+                break
+            if ch in "\"'":
+                if text.startswith(ch * 3, i):
+                    state = 1 if ch == "'" else 2
+                    end = text.find(ch * 3, i + 3)
+                    if end == -1:
+                        self.setFormat(i, n - i, self.f_string)
+                        self.setCurrentBlockState(state)
+                        return
+                    self.setFormat(i, end + 3 - i, self.f_string)
+                    i, state = end + 3, 0
+                    continue
+                j = i + 1
+                while j < n and text[j] != ch:
+                    if text[j] == "\\":
+                        j += 1
+                    j += 1
+                j = min(j + 1, n)
+                self.setFormat(i, j - i, self.f_string)
+                i = j
+                continue
+            i += 1
         self.setCurrentBlockState(0)
 
 
@@ -252,10 +292,18 @@ class SmearCursor(QWidget):
         self.anim.setInterval(8)
         self.anim.timeout.connect(self._tick)
 
+        # only runs while the editor has focus (started/stopped from the editor)
         self.breathe = QTimer(self)
         self.breathe.setInterval(33)
         self.breathe.timeout.connect(self._breathe_tick)
-        self.breathe.start()
+
+    def start_breathing(self):
+        self._t0 = time.perf_counter()
+        if not self.breathe.isActive():
+            self.breathe.start()
+
+    def stop_breathing(self):
+        self.breathe.stop()
 
     def _breathe_tick(self):
         if not self.anim.isActive() and self.editor.hasFocus():
@@ -389,6 +437,11 @@ class LineNumberArea(QWidget):
 class CodeEditor(QPlainTextEdit):
     syntax_changed = Signal(bool, str)
 
+    # words offered by autocomplete besides the ones found in the document
+    STATIC_WORDS = (set(keyword.kwlist)
+                    | {n for n in dir(builtins) if not n.startswith("_")}
+                    | {"self", "cls", "__init__", "__name__", "__main__", "__file__"})
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.path = None
@@ -419,6 +472,15 @@ class CodeEditor(QPlainTextEdit):
         self._retarget_timer = QTimer(self)
         self._retarget_timer.setSingleShot(True)
         self._retarget_timer.timeout.connect(self.cursor_fx.retarget)
+
+        # ---- ghost suggestion (faded inline text, Tab / Right accepts)
+        self._doc_words = set()
+        self._words_rev = -1
+        self._ghost_text = ""
+        self._ghost_pos = -1
+        self._ghost_prefix = None
+        self._ghost_cands = []
+        self._ghost_idx = 0
 
         self.blockCountChanged.connect(self._update_margin)
         self.updateRequest.connect(self._update_gutter)
@@ -470,14 +532,20 @@ class CodeEditor(QPlainTextEdit):
 
     def focusInEvent(self, e):
         super().focusInEvent(e)
+        self.cursor_fx.start_breathing()
         self.cursor_fx.update()
 
     def focusOutEvent(self, e):
         super().focusOutEvent(e)
+        self.cursor_fx.stop_breathing()
+        self._clear_ghost()
         self.cursor_fx.update()
 
     def _on_cursor_moved(self):
+        if self._ghost_text and self.textCursor().position() != self._ghost_pos:
+            self._ghost_text, self._ghost_prefix = "", None
         self._refresh_selections()
+        self.viewport().update()
         self._retarget_timer.start(0)
 
     def paint_line_numbers(self, event):
@@ -513,6 +581,16 @@ class CodeEditor(QPlainTextEdit):
         cur_sel.cursor.clearSelection()
         sels.append(cur_sel)
 
+        if self._ghost_active():
+            tail = self.textCursor()
+            tail.clearSelection()
+            tail.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            if tail.hasSelection():          # hidden here, redrawn after the ghost in paintEvent
+                hide = QTextEdit.ExtraSelection()
+                hide.format.setForeground(QColor(0, 0, 0, 0))
+                hide.cursor = tail
+                sels.append(hide)
+
         if self.error_line >= 0:
             block = self.document().findBlockByNumber(self.error_line)
             if block.isValid():
@@ -547,48 +625,379 @@ class CodeEditor(QPlainTextEdit):
         self._refresh_selections()
         self.syntax_changed.emit(*self.last_status)
 
-    # ---- typing helpers
+    # -----------------------------------------------------------------------
+    # Typing helpers
+    # -----------------------------------------------------------------------
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Tab and not self.textCursor().hasSelection():
-            self.insertPlainText("    ")
+        key, mods = e.key(), e.modifiers()
+
+        # Ctrl+Space = show a suggestion / cycle to the next one
+        if key == Qt.Key.Key_Space and mods & Qt.KeyboardModifier.ControlModifier:
+            self._update_ghost(cycle=True, min_chars=1)
             return
-        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            line = self.textCursor().block().text()
-            before = line[:self.textCursor().positionInBlock()]
-            indent = line[:len(line) - len(line.lstrip(" \t"))]
-            if before.rstrip().endswith(":"):
-                indent += "    "
-            super().keyPressEvent(e)
-            self.insertPlainText(indent)
+
+        if self._ghost_active():
+            if key == Qt.Key.Key_Tab or (key == Qt.Key.Key_Right and mods == Qt.KeyboardModifier.NoModifier):
+                self._accept_ghost()
+                return
+            if key == Qt.Key.Key_Escape:
+                self._clear_ghost()
+                return
+
+        if key == Qt.Key.Key_Backtab:
+            self._indent_selection(unindent=True)
             return
+
+        if key == Qt.Key.Key_Tab:
+            cur = self.textCursor()
+            if cur.hasSelection():
+                self._indent_selection(unindent=False)
+            else:
+                cur.insertText(" " * (4 - cur.positionInBlock() % 4))   # align to next 4-col stop
+            return
+
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._smart_newline()
+            return
+
+        if key == Qt.Key.Key_Backspace and mods == Qt.KeyboardModifier.NoModifier:
+            if self._smart_backspace():
+                self._update_ghost()
+                return
+
+        if self._handle_pairing(e):
+            self._clear_ghost()
+            return
+
         super().keyPressEvent(e)
+        text = e.text()
+        if (text and (text.isalnum() or text == "_")) or key == Qt.Key.Key_Backspace:
+            self._update_ghost()
+        else:
+            self._clear_ghost()
+
+    # ---- Enter: keep indent, add one level after ':' or an opening bracket,
+    #      and split "(|)" onto three lines. One undo step.
+    def _smart_newline(self):
+        cur = self.textCursor()
+        cur.beginEditBlock()
+        cur.removeSelectedText()
+        line = cur.block().text()
+        pos = cur.positionInBlock()
+        before, after = line[:pos], line[pos:]
+        indent = line[:len(line) - len(line.lstrip(" \t"))]
+        stripped = before.rstrip()
+        last = stripped[-1:] if stripped else ""
+
+        if last in "([{" and last and after[:1] == PAIRS.get(last):
+            cur.insertText("\n" + indent + "    " + "\n" + indent)
+            cur.setPosition(cur.position() - len(indent) - 1)    # back onto the middle line
+        else:
+            extra = "    " if last in (":", "(", "[", "{") and last else ""
+            cur.insertText("\n" + indent + extra)
+        cur.endEditBlock()
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
+    # ---- Backspace: remove up to 4 spaces of indentation, or an empty pair like ()
+    def _smart_backspace(self) -> bool:
+        cur = self.textCursor()
+        if cur.hasSelection():
+            return False
+        line = cur.block().text()
+        pos = cur.positionInBlock()
+        before = line[:pos]
+
+        if before.endswith(" ") and before.strip() == "":
+            n = min(pos % 4 or 4, len(before) - len(before.rstrip(" ")))
+            cur.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.KeepAnchor, n)
+            cur.removeSelectedText()
+            self.setTextCursor(cur)
+            return True
+
+        if 0 < pos < len(line) and PAIRS.get(line[pos - 1]) == line[pos]:
+            cur.beginEditBlock()
+            cur.deleteChar()
+            cur.deletePreviousChar()
+            cur.endEditBlock()
+            self.setTextCursor(cur)
+            return True
+        return False
+
+    # ---- Tab / Shift+Tab on a selection (or Shift+Tab on the current line)
+    def _indent_selection(self, unindent: bool):
+        cur = self.textCursor()
+        doc = self.document()
+        start, end = cur.selectionStart(), cur.selectionEnd()
+        first, last = doc.findBlock(start), doc.findBlock(end)
+        if end > start and last.position() == end and last.blockNumber() > first.blockNumber():
+            last = last.previous()          # selection ended at the very start of a line
+
+        cur.beginEditBlock()
+        block = first
+        while block.isValid():
+            c = QTextCursor(block)
+            text = block.text()
+            if unindent:
+                if text.startswith("\t"):
+                    n = 1
+                else:
+                    n = min(4, len(text) - len(text.lstrip(" ")))
+                if n:
+                    c.movePosition(QTextCursor.MoveOperation.Right, QTextCursor.MoveMode.KeepAnchor, n)
+                    c.removeSelectedText()
+            elif text.strip():
+                c.insertText("    ")
+            if block.blockNumber() >= last.blockNumber():
+                break
+            block = block.next()
+        cur.endEditBlock()
+
+    # ---- auto-close brackets and quotes, with type-over and selection wrapping
+    def _handle_pairing(self, e) -> bool:
+        ch = e.text()
+        if len(ch) != 1 or ch not in PAIRS and ch not in CLOSERS:
+            return False
+        mods = e.modifiers()
+        if (mods & Qt.KeyboardModifier.ControlModifier) and not (mods & Qt.KeyboardModifier.AltModifier):
+            return False
+
+        cur = self.textCursor()
+
+        # wrap a selection:  abc  +  "   ->   "abc"
+        if cur.hasSelection():
+            if ch not in PAIRS:
+                return False
+            start, end = cur.selectionStart(), cur.selectionEnd()
+            cur.beginEditBlock()
+            cur.setPosition(end)
+            cur.insertText(PAIRS[ch])
+            cur.setPosition(start)
+            cur.insertText(ch)
+            cur.setPosition(start + 1)
+            cur.setPosition(end + 1, QTextCursor.MoveMode.KeepAnchor)
+            cur.endEditBlock()
+            self.setTextCursor(cur)
+            return True
+
+        line = cur.block().text()
+        pos = cur.positionInBlock()
+        prv = line[pos - 1] if pos > 0 else ""
+        nxt = line[pos] if pos < len(line) else ""
+
+        # typing the closing char right before an identical one just steps over it
+        if ch in CLOSERS and nxt == ch:
+            cur.movePosition(QTextCursor.MoveOperation.Right)
+            self.setTextCursor(cur)
+            return True
+
+        if ch in "([{":
+            if nxt and not (nxt.isspace() or nxt in ")]}"):
+                return False
+        elif ch in "\"'":
+            if prv == ch:                                   # third quote of """ / '''
+                return False
+            if (prv.isalnum() or prv == "_") and not STRING_PREFIX_RE.search(line[:pos]):
+                return False                                # apostrophe in don't, it's ...
+            if nxt and not (nxt.isspace() or nxt in ")]},:;"):
+                return False
+        else:
+            return False                                    # a lone closer: plain insert
+
+        cur.beginEditBlock()
+        cur.insertText(ch + PAIRS[ch])
+        cur.movePosition(QTextCursor.MoveOperation.Left)
+        cur.endEditBlock()
+        self.setTextCursor(cur)
+        return True
+
+    # -----------------------------------------------------------------------
+    # Ghost suggestion (keywords + builtins + words already in the file)
+    # -----------------------------------------------------------------------
+    def _word_prefix(self) -> str:
+        cur = self.textCursor()
+        before = cur.block().text()[:cur.positionInBlock()]
+        m = re.search(r"[A-Za-z_]\w*$", before)
+        return m.group(0) if m else ""
+
+    def _ghost_active(self) -> bool:
+        if not self._ghost_text or not self.hasFocus():
+            return False
+        cur = self.textCursor()
+        return not cur.hasSelection() and cur.position() == self._ghost_pos
+
+    def _clear_ghost(self):
+        had = bool(self._ghost_text)
+        self._ghost_text, self._ghost_prefix = "", None
+        if had:
+            self._refresh_selections()
+            self.viewport().update()
+
+    def _in_string_or_comment(self, cur) -> bool:
+        col = cur.positionInBlock()
+        if col == 0:
+            return False
+        skip = {self.highlighter.f_string.foreground().color().name(),
+                self.highlighter.f_comment.foreground().color().name()}
+        try:
+            for fr in cur.block().layout().formats():
+                if fr.start <= col - 1 < fr.start + fr.length \
+                        and fr.format.foreground().color().name() in skip:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _candidates(self, prefix: str):
+        rev = self.document().revision()
+        if rev != self._words_rev:
+            self._words_rev = rev
+            self._doc_words = set(re.findall(r"[A-Za-z_]\w{2,}", self.toPlainText()))
+        doc = {w for w in self._doc_words if w.startswith(prefix) and w != prefix}
+        static = {w for w in self.STATIC_WORDS if w.startswith(prefix) and w != prefix} - doc
+        key = lambda w: (len(w), w.lower())
+        return sorted(doc, key=key) + sorted(static, key=key)    # your own names first
+
+    def _update_ghost(self, cycle: bool = False, min_chars: int = GHOST_MIN_CHARS):
+        cur = self.textCursor()
+        prefix = self._word_prefix()
+        line, pos = cur.block().text(), cur.positionInBlock()
+        tail = line[pos:]
+        if (cur.hasSelection() or len(prefix) < min_chars or len(tail) > 24
+                or not set(tail) <= GHOST_TAIL_CHARS or self._in_string_or_comment(cur)):
+            self._clear_ghost()
+            return
+
+        if prefix != self._ghost_prefix:
+            self._ghost_cands = self._candidates(prefix)
+            self._ghost_idx, self._ghost_prefix = 0, prefix
+        elif cycle and self._ghost_cands:
+            self._ghost_idx = (self._ghost_idx + 1) % len(self._ghost_cands)
+        if not self._ghost_cands:
+            self._clear_ghost()
+            return
+
+        self._ghost_text = self._ghost_cands[self._ghost_idx][len(prefix):]
+        self._ghost_pos = cur.position()
+        self._refresh_selections()
+        self.viewport().update()
+
+    def _accept_ghost(self):
+        text = self._ghost_text
+        self._clear_ghost()
+        cur = self.textCursor()
+        cur.insertText(text)
+        self.setTextCursor(cur)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if not self._ghost_active():
+            return
+        r = self.cursorRect()
+        fm = self.fontMetrics()
+        cur = self.textCursor()
+        tail = cur.block().text()[cur.positionInBlock():]
+        x = r.left() + 2
+        y = r.top() + fm.ascent()
+        p = QPainter(self.viewport())
+        p.setFont(self.font())
+        p.setPen(GHOST_COLOR)
+        p.drawText(x, y, self._ghost_text)
+        if tail:                                   # real text pushed aside, like a normal insert
+            p.setPen(QColor("#ABB2BF"))
+            p.drawText(x + fm.horizontalAdvance(self._ghost_text), y, tail)
 
 
 # ---------------------------------------------------------------------------
 # Output console
 # ---------------------------------------------------------------------------
 class OutputConsole(QPlainTextEdit):
+    """Program output + a live input line: type after the last output and press
+    Enter to send the text to the running script's stdin (input() works)."""
+    submitted = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setReadOnly(True)
+        self._input_start = 0           # everything before this is program output
+        self.setUndoRedoEnabled(False)
+        self.setCursorWidth(2)
         self.setFont(QFont(CODE_FONT, 10))
         self.setStyleSheet("""
             QPlainTextEdit {
                 background-color: rgba(0, 0, 0, 0.18);
-                color: #A0AEC0;
+                color: #E2E8F0;
                 border: none;
                 border-top: 1px solid rgba(255,255,255,0.10);
+                selection-background-color: rgba(125, 211, 252, 0.28);
             }
         """)
 
+    def clear(self):
+        super().clear()
+        self._input_start = 0
+
     def write(self, text: str, tag: str = "out"):
+        sb = self.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 4
         fmt = QTextCharFormat()
         fmt.setForeground(QColor("#E06C75" if tag == "err" else "#A0AEC0"))
-        c = self.textCursor()
-        c.movePosition(QTextCursor.MoveOperation.End)
+        c = QTextCursor(self.document())
+        c.setPosition(self._input_start)       # output goes above whatever is being typed
         c.insertText(text, fmt)
+        self._input_start = c.position()
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def _submit(self):
+        c = QTextCursor(self.document())
+        c.setPosition(self._input_start)
+        c.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        line = c.selectedText().replace("\u2029", "\n")
+        c.clearSelection()
+        c.movePosition(QTextCursor.MoveOperation.End)
+        c.insertText("\n")
+        self._input_start = c.position()
         self.setTextCursor(c)
         self.ensureCursorVisible()
+        self.submitted.emit(line + "\n")
+
+    def keyPressEvent(self, e):
+        key, mods = e.key(), e.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        cur = self.textCursor()
+
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._submit()
+            return
+        if key == Qt.Key.Key_Tab or key == Qt.Key.Key_Backtab:
+            return
+        if key == Qt.Key.Key_Home and not ctrl:
+            keep = (QTextCursor.MoveMode.KeepAnchor if mods & Qt.KeyboardModifier.ShiftModifier
+                    else QTextCursor.MoveMode.MoveAnchor)
+            if cur.position() >= self._input_start:
+                cur.setPosition(self._input_start, keep)
+                self.setTextCursor(cur)
+                return
+
+        text = e.text()
+        typing = bool(text) and text.isprintable() and not (ctrl and not alt)
+        paste = (ctrl and key == Qt.Key.Key_V) or (
+            key == Qt.Key.Key_Insert and mods & Qt.KeyboardModifier.ShiftModifier)
+        deleting = key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) or (ctrl and key == Qt.Key.Key_X)
+
+        if deleting:
+            if cur.selectionStart() < self._input_start:
+                return                                  # old output is read-only
+            if key == Qt.Key.Key_Backspace and not cur.hasSelection() \
+                    and cur.position() <= self._input_start:
+                return
+        elif typing or paste:
+            if cur.selectionStart() < self._input_start or cur.position() < self._input_start:
+                cur.clearSelection()
+                cur.movePosition(QTextCursor.MoveOperation.End)
+                self.setTextCursor(cur)
+        super().keyPressEvent(e)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +1119,124 @@ class GlassMenu(QMenu):
 
 
 # ---------------------------------------------------------------------------
+# Themed message box (replaces QMessageBox): frosted glass + platinum titlebar
+# ---------------------------------------------------------------------------
+class GlassDialog(QDialog):
+    BAR_H = 32
+    BUTTON_STYLES = {
+        "normal": """
+            QPushButton { background: rgba(255,255,255,0.08); color: #F8FAFC;
+                border: 1px solid rgba(255,255,255,0.16); border-radius: 6px; padding: 6px 18px; }
+            QPushButton:hover { background: rgba(255,255,255,0.16); }
+        """,
+        "danger": """
+            QPushButton { background: transparent; color: #E06C75;
+                border: 1px solid rgba(224,108,117,0.45); border-radius: 6px; padding: 6px 18px; }
+            QPushButton:hover { background: rgba(224,108,117,0.16); }
+        """,
+        "primary": """
+            QPushButton { background: #E5E9F0; color: #0F172A; font-weight: bold;
+                border: 1px solid #CBD5E1; border-radius: 6px; padding: 6px 20px; }
+            QPushButton:hover { background: #FFFFFF; }
+        """,
+    }
+
+    def __init__(self, parent, title, text, hint, buttons):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setModal(True)
+        self.setFixedWidth(400)
+        self.choice = None
+        self._glass_done = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        bar = QWidget(self)
+        bar.setFixedHeight(self.BAR_H)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(14, 0, 12, 0)
+        lbl = QLabel(title)
+        lbl.setStyleSheet("color: #0F172A; font-size: 12px; font-weight: bold; background: transparent;")
+        close = CircleButton("#1E3A8A", "×", bar)
+        close.clicked.connect(self.reject)
+        bl.addWidget(lbl)
+        bl.addStretch()
+        bl.addWidget(close)
+        root.addWidget(bar)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(22, 18, 22, 18)
+        body.setSpacing(6)
+        msg = QLabel(text)
+        msg.setWordWrap(True)
+        msg.setStyleSheet("color: #F1F5F9; font-size: 14px; background: transparent;")
+        body.addWidget(msg)
+        if hint:
+            h = QLabel(hint)
+            h.setWordWrap(True)
+            h.setStyleSheet("color: #94A3B8; font-size: 12px; background: transparent;")
+            body.addWidget(h)
+        body.addSpacing(10)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch()
+        for label, key, kind in buttons:
+            b = QPushButton(label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(self.BUTTON_STYLES[kind])
+            b.clicked.connect(lambda _=False, k=key: self._pick(k))
+            if kind == "primary":
+                b.setDefault(True)
+            row.addWidget(b)
+        body.addLayout(row)
+        root.addLayout(body)
+
+    def _pick(self, key):
+        self.choice = key
+        self.accept()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if IS_WIN and not self._glass_done:
+            self._glass_done = True
+            enable_glass(int(self.winId()))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        shape = QPainterPath()
+        shape.addRoundedRect(QRectF(0, 0, w, h), WINDOW_RADIUS, WINDOW_RADIUS)
+        p.setClipPath(shape)
+        p.fillRect(self.rect(), QColor(15, 23, 42, 150))          # tint (kept > 0 alpha)
+        p.fillRect(0, 0, w, self.BAR_H, PLATINUM_SILVER)
+        p.setPen(QPen(PLATINUM_BORDER, 1))
+        p.drawLine(0, self.BAR_H, w, self.BAR_H)
+        p.setClipping(False)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), WINDOW_RADIUS, WINDOW_RADIUS)
+
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.MouseButton.LeftButton and event.position().y() < self.BAR_H
+                and self.windowHandle()):
+            self.windowHandle().startSystemMove()
+            return
+        super().mousePressEvent(event)
+
+
+def glass_message(parent, title, text, buttons, hint="") -> str:
+    """buttons: [(label, key, 'normal' | 'danger' | 'primary')]. Returns the key, or 'cancel'."""
+    dlg = GlassDialog(parent, title, text, hint, buttons)
+    dlg.exec()
+    return dlg.choice or "cancel"
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -731,6 +1258,10 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._build_menu()
         self._wire_signals()
+
+        # Linux/macOS: no WM_NCHITTEST, so edge-resize is handled via an event filter
+        if not IS_WIN:
+            QApplication.instance().installEventFilter(self)
 
         if initial_path and initial_path.exists():
             self.open_file_path(initial_path)
@@ -821,13 +1352,17 @@ class MainWindow(QMainWindow):
         t.btn_close.clicked.connect(self.close)
         self.tabbar.tabCloseRequested.connect(self.close_tab)
         self.tabbar.currentChanged.connect(self._on_tab_changed)
+        self.output.submitted.connect(self._send_input)
 
     def _show_menu(self):
         btn = self.titlebar.btn_app_icon
         self.menu.exec(btn.mapToGlobal(QPoint(0, btn.height() + 4)))
 
     def _toggle_maximize(self):
-        self.showNormal() if self.isMaximized() else self.showMaximized()
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
 
     # ---- status bar
     def _on_syntax(self, editor, ok, msg):
@@ -891,20 +1426,25 @@ class MainWindow(QMainWindow):
         name = editor.path.name if editor.path else "Untitled.py"
         self.tabbar.setTabText(idx, name + (" *" if editor.document().isModified() else ""))
 
+    def _confirm_discard(self, editor) -> bool:
+        """Ask about unsaved changes. True = ok to go on (saved or discarded)."""
+        if not editor.document().isModified():
+            return True
+        name = editor.path.name if editor.path else "Untitled.py"
+        r = glass_message(
+            self, "Unsaved changes", f"Save changes to {name}?",
+            [("Discard", "discard", "danger"), ("Cancel", "cancel", "normal"), ("Save", "save", "primary")],
+            hint="Your changes will be lost if you don't save them.")
+        if r == "save":
+            return self.save(editor)
+        return r == "discard"
+
     def close_tab(self, index: int):
         editor = self._editor_at(index)
         if editor is None:
             return
-        if editor.document().isModified():
-            name = editor.path.name if editor.path else "Untitled.py"
-            r = QMessageBox.question(
-                self, "Unsaved changes", f"Save changes to {name}?",
-                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
-                | QMessageBox.StandardButton.Cancel)
-            if r == QMessageBox.StandardButton.Cancel:
-                return
-            if r == QMessageBox.StandardButton.Save and not self.save(editor):
-                return
+        if not self._confirm_discard(editor):
+            return
         if self.tabbar.count() == 1:
             self.new_tab()
         idx = self._index_of(editor)
@@ -918,7 +1458,8 @@ class MainWindow(QMainWindow):
         try:
             path.write_text(editor.toPlainText(), encoding="utf-8")
         except OSError as e:
-            QMessageBox.warning(self, "Save failed", str(e))
+            glass_message(self, "Save failed", "Could not save the file.",
+                          [("OK", "ok", "primary")], hint=str(e))
             return False
         editor.path = path
         editor.document().setModified(False)
@@ -971,26 +1512,31 @@ class MainWindow(QMainWindow):
 
         name = editor.path.name if editor.path else "Untitled.py"
         env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")      # same encoding in both directions
+        workdir = editor.path.parent if editor.path else Path.home()
 
         if editor.path and not editor.document().isModified():
             # saved and unchanged: run the real file
-            script, workdir, label = editor.path, editor.path.parent, name
+            args, label = ["-u", str(editor.path)], name
         else:
-            # untitled or edited: run the buffer as-is from a temp copy
+            # untitled or edited: run the buffer from a temp copy, through a tiny bootstrap
+            # that sets __file__, sys.path, argv and tracebacks as if it were the real file
             self._tmp = tempfile.TemporaryDirectory(prefix="ide_run_")
-            script = Path(self._tmp.name) / name
-            script.write_text(editor.toPlainText(), encoding="utf-8")
-            workdir = editor.path.parent if editor.path else Path.home()
+            tmp = Path(self._tmp.name)
+            src = tmp / "buffer.py"
+            boot = tmp / "_ide_boot.py"
+            src.write_text(editor.toPlainText(), encoding="utf-8")
+            boot.write_text(BOOTSTRAP, encoding="utf-8")
+            real = editor.path if editor.path else workdir / name
+            args = ["-u", str(boot), str(src), str(real)]
             label = f"{name} (unsaved)"
-            old = env.value("PYTHONPATH", "")
-            env.insert("PYTHONPATH", str(workdir) + (os.pathsep + old if old else ""))
 
         self.output.write(f"> Running {label}...\n")
 
         proc = QProcess(self)
         self.proc = proc
         proc.setProgram(python)
-        proc.setArguments(["-u", str(script)])
+        proc.setArguments(args)
         proc.setWorkingDirectory(str(workdir))
         proc.setProcessEnvironment(env)
         proc.readyReadStandardOutput.connect(
@@ -999,6 +1545,10 @@ class MainWindow(QMainWindow):
             lambda: self.output.write(bytes(proc.readAllStandardError()).decode(errors="replace"), "err"))
         proc.finished.connect(lambda code, _: self._on_finished(proc, code))
         proc.start()
+
+    def _send_input(self, text: str):
+        if self.proc is not None and self.proc.state() == QProcess.ProcessState.Running:
+            self.proc.write(text.encode("utf-8"))
 
     def _on_finished(self, proc, code):
         if proc is self.proc:
@@ -1023,6 +1573,13 @@ class MainWindow(QMainWindow):
             self.output.hide()
 
     def closeEvent(self, event):
+        # ask about every modified tab before the window goes away
+        for ed in list(self.editors.values()):
+            if ed.document().isModified():
+                self.tabbar.setCurrentIndex(self._index_of(ed))
+                if not self._confirm_discard(ed):
+                    event.ignore()
+                    return
         self.stop_script(hide=False)
         super().closeEvent(event)
 
@@ -1045,6 +1602,49 @@ class MainWindow(QMainWindow):
         painter.fillRect(0, 0, w, TITLEBAR_HEIGHT, PLATINUM_SILVER)
         painter.setPen(QPen(PLATINUM_BORDER, 1))
         painter.drawLine(0, TITLEBAR_HEIGHT, w, TITLEBAR_HEIGHT)
+
+    # ---- Linux / macOS: drag + resize through the window manager
+    def _edges_at(self, pos):
+        edges = Qt.Edge(0)
+        if self.isMaximized() or self.isFullScreen():
+            return edges
+        b = RESIZE_BORDER
+        if pos.x() < b:
+            edges |= Qt.Edge.LeftEdge
+        if pos.x() > self.width() - b:
+            edges |= Qt.Edge.RightEdge
+        if pos.y() < b:
+            edges |= Qt.Edge.TopEdge
+        if pos.y() > self.height() - b:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def eventFilter(self, obj, ev):
+        if (not IS_WIN and ev.type() == QEvent.Type.MouseButtonPress
+                and ev.button() == Qt.MouseButton.LeftButton
+                and isinstance(obj, QWidget) and obj.window() is self):
+            pos = self.mapFromGlobal(ev.globalPosition().toPoint())
+            edges = self._edges_at(pos)
+            handle = self.windowHandle()
+            if edges and handle:
+                handle.startSystemResize(edges)
+                return True
+        return super().eventFilter(obj, ev)
+
+    def mousePressEvent(self, event):
+        # only reached for clicks on empty titlebar space (buttons/tabs accept theirs)
+        if (not IS_WIN and event.button() == Qt.MouseButton.LeftButton
+                and event.position().y() < TITLEBAR_HEIGHT and self.windowHandle()):
+            self.windowHandle().startSystemMove()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if (not IS_WIN and event.button() == Qt.MouseButton.LeftButton
+                and event.position().y() < TITLEBAR_HEIGHT):
+            self._toggle_maximize()
+            return
+        super().mouseDoubleClickEvent(event)
 
     # ---- Windows native drag / resize
     def nativeEvent(self, event_type, message):

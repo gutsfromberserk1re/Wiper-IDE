@@ -5,7 +5,7 @@ Is an IDE for **python**
 # Download
 
 <p align="center">
-  <a href="https://github.com/gutsfromberserk1re/Wiper-IDE/releases/latest">
+  <a href="https://github.com/gutsfromberserk1re/Wiper-IDE/releases/download/IDE/Wiper.exe">
     <img src="https://img.shields.io/badge/Download-Wiper.exe-blue?style=for-the-badge&logo=windows" alt="Download Wiper IDE">
   </a>
 </p>

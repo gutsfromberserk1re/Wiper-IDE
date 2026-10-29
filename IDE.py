@@ -8,20 +8,23 @@ import keyword
 import builtins
 import math
 import time
+import codecs
+import warnings
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QProcess, QProcessEnvironment,
-    QTimer, Signal
+    Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QDir, QProcess, QProcessEnvironment,
+    QTimer, Signal, QVariantAnimation, QEasingCurve, QAbstractAnimation
 )
 from PySide6.QtGui import (
     QPainter, QPainterPath, QColor, QPen, QFont, QFontDatabase, QKeySequence, QAction,
-    QIcon, QCursor, QTextCursor, QTextFormat, QPolygonF, QSyntaxHighlighter, QTextCharFormat
+    QIcon, QCursor, QTextCursor, QTextFormat, QPolygonF, QSyntaxHighlighter, QTextCharFormat, QShortcut
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPlainTextEdit, QTextEdit, QLabel, QPushButton, QAbstractButton, QMenu,
-    QFileDialog, QTabBar, QStackedWidget, QDialog
+    QFileDialog, QTabBar, QStackedWidget, QDialog, QTreeView, QFileSystemModel,
+    QTabWidget, QFrame, QLineEdit, QListWidget, QListWidgetItem
 )
 
 IS_WIN = sys.platform == "win32"
@@ -51,7 +54,7 @@ def find_icon():
 ICON_PATH = find_icon()
 FONT_DIR = APP_DIR / "fonts"
 
-APP_NAME = "MyPythonIDE"
+APP_NAME = "Wiper IDE"
 TITLEBAR_HEIGHT = 38
 WINDOW_RADIUS = 8
 RESIZE_BORDER = 6
@@ -67,6 +70,10 @@ WORKSPACE_TINT = QColor(15, 23, 42, TINT_ALPHA)
 CURSOR_COLOR = "#E5E9F0"      # cursor core (silver / platinum)
 GLOW_COLOR = "#B8C2D0"        # soft silver halo around it
 CURSOR_WIDTH = 4                  # thickness in px (legacy-CLI chunky)
+SIDEBAR_WIDTH = 270               # default Explorer width
+SIDEBAR_MIN_WIDTH = 180           # narrowest the open sidebar can be dragged
+SIDEBAR_MAX_WIDTH = 480
+SIDEBAR_ANIM_MS = 220             # open/close duration
 CODE_FONT = "Consolas"            # replaced at startup by JetBrains Mono if found
 
 # ---------------------------------------------------------------------------
@@ -207,11 +214,15 @@ class PythonHighlighter(QSyntaxHighlighter):
             (r"\b(?:True|False|None)\b",                _fmt("#D19A66", bold=True), 0),
             (r"\b(?:" + "|".join(self.BUILTINS) + r")\b", _fmt("#56B6C2"), 0),
             (r"\b(?:self|cls)\b",                       _fmt("#E06C75", italic=True), 0),
-            (r"\b(?:0[xX][0-9a-fA-F_]+|\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?)\b",
+            (r"\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?)\b",
                                                         _fmt("#D19A66"), 0),
             (r"@\w+(?:\.\w+)*",                         _fmt("#E5C07B"), 0),
             (r"\bdef\s+(\w+)",                          _fmt("#61AFEF", bold=True), 1),
             (r"\bclass\s+(\w+)",                        _fmt("#E5C07B", bold=True), 1),
+            (r"(?:==|!=|<=|>=|:=|->|\*\*|//|<<|>>|[+\-*/%@&|^~<>]=?)",
+                                                        _fmt("#56B6C2"), 0),
+            (r"[()\[\]{}]",                              _fmt("#ABB2BF"), 0),
+            (r"\b__[A-Za-z_]\w*__\b",                   _fmt("#E5C07B"), 0),
         ]
         self.rules = [(re.compile(p), f, g) for p, f, g in self.rules]
 
@@ -351,7 +362,9 @@ class SmearCursor(QWidget):
 
     def retarget(self, animate=True):
         r = self.editor.cursorRect()
-        x, y, h = r.left(), r.top(), r.height()
+        # centre the bar on the caret boundary so it sits BETWEEN characters
+        # (e.g. between the two quotes of "") instead of covering the next one
+        x, y, h = max(r.left() - CURSOR_WIDTH // 2, 0), r.top(), r.height()
         new = [QPointF(x, y), QPointF(x + CURSOR_WIDTH, y),
                QPointF(x + CURSOR_WIDTH, y + h), QPointF(x, y + h)]
         self._t0 = time.perf_counter()
@@ -450,6 +463,9 @@ class CodeEditor(QPlainTextEdit):
         self.error_line = -1
         self.error_col = 0
         self.last_status = (True, "")
+        self._tree = None               # cached ast, shared by syntax check + outline
+        self._tree_err = None
+        self._tree_rev = -1
 
         font = QFont(CODE_FONT, 11)
         font.setStyleHint(QFont.StyleHint.Monospace)
@@ -503,12 +519,18 @@ class CodeEditor(QPlainTextEdit):
 
     def _layout_overlays(self):
         cr = self.contentsRect()
-        self.gutter.setGeometry(QRect(cr.left(), cr.top(), self._gutter_w, cr.height()))
+        gg = QRect(cr.left(), cr.top(), self._gutter_w, cr.height())
+        if self.gutter.geometry() != gg:
+            self.gutter.setGeometry(gg)
         vg = self.viewport().geometry()
-        if self.cursor_fx.geometry() != vg:      # only snap if the viewport really moved
+        old = self.cursor_fx.geometry()
+        if old != vg:
             self.cursor_fx.setGeometry(vg)
-            self.cursor_fx.raise_()
-            self.cursor_fx.retarget(False)
+            # The caret is stored in viewport coordinates, so a pure size change
+            # (e.g. the sidebar sliding open) needs no re-snap - only a moved origin does.
+            if vg.topLeft() != old.topLeft() or not self.cursor_fx.ready:
+                self.cursor_fx.raise_()
+                self.cursor_fx.retarget(False)
 
     def _update_margin(self):
         w = self.line_number_width()
@@ -610,18 +632,32 @@ class CodeEditor(QPlainTextEdit):
         self.setExtraSelections(sels)
         self.gutter.update()
 
+    def parse_tree(self):
+        """(tree, error) for the current text. Parsed once per document revision, so
+        the syntax check and the outline never parse the same text twice."""
+        rev = self.document().revision()
+        if rev != self._tree_rev:
+            self._tree_rev = rev
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")      # e.g. invalid escape sequence warnings
+                    self._tree, self._tree_err = ast.parse(self.toPlainText()), None
+            except Exception as e:                       # SyntaxError, ValueError (NUL), RecursionError...
+                self._tree, self._tree_err = None, e
+        return self._tree, self._tree_err
+
     def _validate_syntax(self):
-        try:
-            ast.parse(self.toPlainText())
+        _, err = self.parse_tree()
+        if err is None:
             self.error_line, self.error_col = -1, 0
             self.last_status = (True, "No syntax errors")
-        except SyntaxError as e:
-            self.error_line = (e.lineno or 1) - 1
-            self.error_col = max((e.offset or 1) - 1, 0)
-            self.last_status = (False, f"Line {e.lineno}: {e.msg}")
-        except Exception as e:
+        elif isinstance(err, SyntaxError):
+            self.error_line = (err.lineno or 1) - 1
+            self.error_col = max((err.offset or 1) - 1, 0)
+            self.last_status = (False, f"Line {err.lineno or 1}: {err.msg}")
+        else:
             self.error_line, self.error_col = -1, 0
-            self.last_status = (False, str(e))
+            self.last_status = (False, str(err))
         self._refresh_selections()
         self.syntax_changed.emit(*self.last_status)
 
@@ -643,6 +679,16 @@ class CodeEditor(QPlainTextEdit):
             if key == Qt.Key.Key_Escape:
                 self._clear_ghost()
                 return
+
+        if key == Qt.Key.Key_Slash and mods & Qt.KeyboardModifier.ControlModifier:
+            self._clear_ghost()
+            self._toggle_comment()
+            return
+
+        if key == Qt.Key.Key_Home and not mods & Qt.KeyboardModifier.ControlModifier:
+            self._clear_ghost()
+            self._smart_home(bool(mods & Qt.KeyboardModifier.ShiftModifier))
+            return
 
         if key == Qt.Key.Key_Backtab:
             self._indent_selection(unindent=True)
@@ -686,6 +732,7 @@ class CodeEditor(QPlainTextEdit):
         pos = cur.positionInBlock()
         before, after = line[:pos], line[pos:]
         indent = line[:len(line) - len(line.lstrip(" \t"))]
+        indent = indent[:pos]            # Enter inside the indentation must not duplicate it
         stripped = before.rstrip()
         last = stripped[-1:] if stripped else ""
 
@@ -693,7 +740,8 @@ class CodeEditor(QPlainTextEdit):
             cur.insertText("\n" + indent + "    " + "\n" + indent)
             cur.setPosition(cur.position() - len(indent) - 1)    # back onto the middle line
         else:
-            extra = "    " if last in (":", "(", "[", "{") and last else ""
+            in_comment = stripped.lstrip().startswith("#")      # "# note:" is not a block opener
+            extra = "    " if last and last in ":([{" and not in_comment else ""
             cur.insertText("\n" + indent + extra)
         cur.endEditBlock()
         self.setTextCursor(cur)
@@ -753,6 +801,51 @@ class CodeEditor(QPlainTextEdit):
             block = block.next()
         cur.endEditBlock()
 
+    # ---- Home: first non-blank character, then column 0 (press again)
+    def _smart_home(self, select: bool):
+        cur = self.textCursor()
+        block = cur.block()
+        line = block.text()
+        first = block.position() + len(line) - len(line.lstrip(" \t"))
+        target = first if cur.position() != first else block.position()
+        mode = QTextCursor.MoveMode.KeepAnchor if select else QTextCursor.MoveMode.MoveAnchor
+        cur.setPosition(target, mode)
+        self.setTextCursor(cur)
+
+    # ---- Ctrl+/ : comment / uncomment the selected lines (one undo step)
+    def _toggle_comment(self):
+        cur = self.textCursor()
+        doc = self.document()
+        start, end = cur.selectionStart(), cur.selectionEnd()
+        first, last = doc.findBlock(start), doc.findBlock(end)
+        if end > start and last.position() == end and last.blockNumber() > first.blockNumber():
+            last = last.previous()
+        blocks, block = [], first
+        while block.isValid():
+            if block.text().strip():
+                blocks.append(block)
+            if block.blockNumber() >= last.blockNumber():
+                break
+            block = block.next()
+        if not blocks:
+            return
+        uncomment = all(b.text().lstrip().startswith("#") for b in blocks)
+        col = min(len(b.text()) - len(b.text().lstrip(" \t")) for b in blocks)
+        cur.beginEditBlock()
+        for b in blocks:
+            text = b.text()
+            c = QTextCursor(b)
+            if uncomment:
+                i = len(text) - len(text.lstrip(" \t"))
+                n = 2 if text[i:i + 2] == "# " else 1
+                c.setPosition(b.position() + i)
+                c.setPosition(b.position() + i + n, QTextCursor.MoveMode.KeepAnchor)
+                c.removeSelectedText()
+            else:
+                c.setPosition(b.position() + col)
+                c.insertText("# ")
+        cur.endEditBlock()
+
     # ---- auto-close brackets and quotes, with type-over and selection wrapping
     def _handle_pairing(self, e) -> bool:
         ch = e.text()
@@ -789,6 +882,7 @@ class CodeEditor(QPlainTextEdit):
         if ch in CLOSERS and nxt == ch:
             cur.movePosition(QTextCursor.MoveOperation.Right)
             self.setTextCursor(cur)
+            self.cursor_fx.retarget(False)          # one-char hop: no smear across the quotes
             return True
 
         if ch in "([{":
@@ -801,14 +895,18 @@ class CodeEditor(QPlainTextEdit):
                 return False                                # apostrophe in don't, it's ...
             if nxt and not (nxt.isspace() or nxt in ")]},:;"):
                 return False
+            if self._in_string_or_comment(cur):             # x = "abc|  ->  closes it, no stray ""
+                return False
         else:
             return False                                    # a lone closer: plain insert
 
+        start = cur.position()
         cur.beginEditBlock()
         cur.insertText(ch + PAIRS[ch])
-        cur.movePosition(QTextCursor.MoveOperation.Left)
+        cur.setPosition(start + 1)                          # caret goes BETWEEN the pair
         cur.endEditBlock()
         self.setTextCursor(cur)
+        self.cursor_fx.retarget(False)                      # draw it there at once, no smear over the pair
         return True
 
     # -----------------------------------------------------------------------
@@ -1001,7 +1099,7 @@ class OutputConsole(QPlainTextEdit):
 
 
 # ---------------------------------------------------------------------------
-# Titlebar: [icon menu] [tabs]  ........  [o min] [o max] [o close]
+# Titlebar: [app icon: left-click Explorer / right-click commands] [tabs] ... [window controls]
 # ---------------------------------------------------------------------------
 class CircleButton(QAbstractButton):
     def __init__(self, color, glyph, parent=None):
@@ -1037,6 +1135,46 @@ class CircleButton(QAbstractButton):
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.glyph)
 
 
+class TitleTabBar(QTabBar):
+    """Titlebar tabs have no close buttons, so middle-click closes a tab."""
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            i = self.tabAt(e.position().toPoint())
+            if i >= 0:
+                self.tabCloseRequested.emit(i)
+                e.accept()
+                return
+        super().mouseReleaseEvent(e)
+
+
+class SlideHost(QWidget):
+    """Clipping container for the sidebar. While the panel slides, its content keeps
+    its full width and is simply revealed - so nothing inside re-lays out on every
+    frame (that per-frame relayout was the main source of stutter)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.inner = None
+        self.full_width = SIDEBAR_WIDTH
+        self.animating = False
+
+    def set_animating(self, on: bool, full_width: int = None):
+        self.animating = on
+        if full_width:
+            self.full_width = full_width
+        self._fit()
+
+    def _fit(self):
+        if self.inner is not None:
+            w = self.full_width if self.animating else self.width()
+            self.inner.setGeometry(0, 0, max(w, 1), self.height())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
+
+
 class TitleBar(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1045,10 +1183,11 @@ class TitleBar(QWidget):
         layout.setContentsMargins(10, 0, 12, 0)
         layout.setSpacing(8)
 
-        # App icon = menu button (red circle until icon.ico exists)
+        # App icon: left-click toggles Explorer; right-click opens the command menu.
         self.btn_app_icon = QPushButton(self)
         self.btn_app_icon.setFixedSize(22, 22)
-        self.btn_app_icon.setToolTip("Menu")
+        self.btn_app_icon.setToolTip("Left-click: toggle Explorer · Ctrl+Tab: toggle sidebar · Right-click: commands")
+        self.btn_app_icon.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.btn_app_icon.setCursor(Qt.CursorShape.PointingHandCursor)
         icon = QIcon(str(ICON_PATH)) if ICON_PATH else QIcon()
         icon_ok = not icon.pixmap(QSize(20, 20)).isNull()
@@ -1066,10 +1205,10 @@ class TitleBar(QWidget):
             """)
             why = ("no .ico file found" if not ICON_PATH
                    else f"Qt could not read {ICON_PATH.name}")
-            self.btn_app_icon.setToolTip(f"Menu  ({why}; looked in {APP_DIR})")
+            self.btn_app_icon.setToolTip(f"Left-click: toggle Explorer · Ctrl+Tab: toggle sidebar · Right-click: commands ({why}; looked in {APP_DIR})")
 
         # Tabs live in the titlebar
-        self.tabbar = QTabBar(self)
+        self.tabbar = TitleTabBar(self)
         self.tabbar.setDrawBase(False)
         self.tabbar.setExpanding(False)
         self.tabbar.setTabsClosable(False)
@@ -1088,9 +1227,13 @@ class TitleBar(QWidget):
         self.btn_min = CircleButton("#D4D4D8", "–", self)
         self.btn_max = CircleButton("#9ACD32", "+", self)
         self.btn_close = CircleButton("#1E3A8A", "×", self)
+        self.brand_label = QLabel("Wiper IDE", self)
+        self.brand_label.setStyleSheet("color: #334155; font-size: 12px; font-weight: 700; padding-right: 5px;")
 
         layout.addWidget(self.btn_app_icon)
         layout.addSpacing(4)
+        layout.addWidget(self.brand_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addSpacing(6)
         layout.addWidget(self.tabbar, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addStretch()
         layout.addWidget(self.btn_min)
@@ -1254,10 +1397,16 @@ class MainWindow(QMainWindow):
         self._glass_done = False
         self.editors = {}
         self._uid = 0
+        self.project_root = None
+        self._git_proc = None
+        self._last_search = None
+        self._outline_key = None
 
         self._setup_ui()
         self._build_menu()
         self._wire_signals()
+        if initial_path and initial_path.exists():
+            self.set_project_root(initial_path if initial_path.is_dir() else initial_path.parent)
 
         # Linux/macOS: no WM_NCHITTEST, so edge-resize is handled via an event filter
         if not IS_WIN:
@@ -1268,6 +1417,9 @@ class MainWindow(QMainWindow):
         else:
             self.new_tab()
 
+        # polish + lay out the sidebar once in the background so the first open is smooth
+        QTimer.singleShot(250, self._prewarm_sidebar)
+
     def showEvent(self, event):
         super().showEvent(event)
         if IS_WIN and not self._glass_done:
@@ -1275,7 +1427,7 @@ class MainWindow(QMainWindow):
             self.native_frame = enable_glass(int(self.winId()))
 
     def _setup_ui(self):
-        self.resize(1000, 650)
+        self.resize(1100, 700)
         self.setStyleSheet("QMainWindow { background: transparent; }")
 
         self.central_widget = QWidget(self)
@@ -1290,20 +1442,183 @@ class MainWindow(QMainWindow):
         self.tabbar = self.titlebar.tabbar
         main_layout.addWidget(self.titlebar)
 
+        # Workspace: the titlebar app icon toggles a compact, animated Explorer.
+        # No permanent activity rail: keep every pixel available to the editor.
+        self.workspace = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace.setChildrenCollapsible(False)
+        self.workspace.setHandleWidth(1)
+        self.workspace.setStyleSheet("QSplitter::handle { background: rgba(255,255,255,0.10); }")
+
+        # Sidebar: compact view switcher (Explorer / Search / Git) with
+        # persistent lower sections for Outline and Python Environment.
+        self.sidebar = SlideHost()
+        self.sidebar_inner = QFrame(self.sidebar)
+        self.sidebar.inner = self.sidebar_inner
+        self.sidebar.setMinimumWidth(0)
+        self.sidebar.setMaximumWidth(SIDEBAR_MAX_WIDTH)
+        self.sidebar_inner.setStyleSheet("""
+            QFrame { background: rgba(13, 20, 33, 0.30); border-right: 1px solid rgba(255,255,255,0.09); }
+            QLabel { color: #CBD5E1; background: transparent; border: none; }
+            QPushButton { color: #DCE4EE; background: rgba(255,255,255,0.045);
+                border: 1px solid rgba(203,213,225,0.15); border-radius: 6px;
+                padding: 6px 8px; text-align: left; }
+            QPushButton:hover { background: rgba(255,255,255,0.10); }
+            QPushButton:checked { background: rgba(148,163,184,0.18); border-color: rgba(203,213,225,0.34); }
+            QLineEdit { color: #E2E8F0; background: rgba(0,0,0,0.18); border: 1px solid rgba(203,213,225,0.18);
+                border-radius: 6px; padding: 7px; selection-background-color: rgba(125,211,252,0.25); }
+            QTreeView, QListWidget { background: transparent; color: #D8E1ED; border: none;
+                outline: none; padding: 3px; selection-background-color: rgba(148,163,184,0.22);
+                selection-color: #FFFFFF; }
+            QTreeView::item, QListWidget::item { min-height: 23px; padding: 3px 4px; border-radius: 4px; }
+            QTreeView::item:hover, QListWidget::item:hover { background: rgba(255,255,255,0.07); }
+            QTabWidget::pane { border: none; background: transparent; }
+            QTabBar { background: transparent; }
+            QTabBar::tab {
+                color: #94A3B8;
+                background: transparent;
+                border: none;
+                padding: 6px 14px;
+                min-width: 42px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QTabBar::tab:selected {
+                color: #E2E8F0;
+                border-bottom: 2px solid #B8C2D0;
+                font-weight: 600;
+            }
+        """)
+        side_layout = QVBoxLayout(self.sidebar_inner)
+        side_layout.setContentsMargins(8, 9, 8, 8)
+        side_layout.setSpacing(7)
+
+        self.sidebar_views = QTabWidget()
+        self.sidebar_views.setDocumentMode(True)
+        self.sidebar_views.setMinimumHeight(150)
+
+        # Explorer view
+        explorer_page = QWidget()
+        explorer_layout = QVBoxLayout(explorer_page)
+        explorer_layout.setContentsMargins(0, 0, 0, 0)
+        explorer_layout.setSpacing(7)
+        self.btn_open_folder = QPushButton("＋  Open Folder")
+        self.btn_open_folder.setToolTip("Choose a project folder")
+        explorer_layout.addWidget(self.btn_open_folder)
+        self.file_model = QFileSystemModel(self)
+        self.file_model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot)
+        self.file_model.setReadOnly(False)
+        self.file_tree = QTreeView()
+        self.file_tree.setModel(self.file_model)
+        self.file_tree.setHeaderHidden(True)
+        for column in range(1, 4):
+            self.file_tree.hideColumn(column)
+        self.file_tree.setAnimated(True)
+        self.file_tree.setIndentation(14)
+        self.file_tree.setUniformRowHeights(True)
+        self.file_tree.setEditTriggers(QTreeView.EditTrigger.EditKeyPressed | QTreeView.EditTrigger.SelectedClicked)
+        self.file_tree.setToolTip("Open a project folder to browse its files")
+        self.explorer_empty = QLabel("Open a folder to explore your project\n\nNo project folder selected")
+        self.explorer_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.explorer_empty.setWordWrap(True)
+        self.explorer_empty.setStyleSheet("color: rgba(203,213,225,0.58); font-size: 11px; padding: 18px;")
+        explorer_layout.addWidget(self.explorer_empty, 1)
+        explorer_layout.addWidget(self.file_tree, 1)
+        self.file_tree.hide()
+        self.sidebar_views.addTab(explorer_page, "Explorer")
+
+        # Project-wide text search
+        search_page = QWidget()
+        search_layout = QVBoxLayout(search_page)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(7)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search in project…")
+        self.search_results = QListWidget()
+        self.search_results.setToolTip("Double-click a result to open the matching file")
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_results, 1)
+        self.sidebar_views.addTab(search_page, "Search")
+
+        # Git is intentionally a thin status view using the local Git CLI.
+        git_page = QWidget()
+        git_layout = QVBoxLayout(git_page)
+        git_layout.setContentsMargins(0, 0, 0, 0)
+        git_layout.setSpacing(7)
+        self.git_refresh = QPushButton("↻  Refresh Git status")
+        self.git_status = QListWidget()
+        self.git_status.setToolTip("Git status for the selected project")
+        git_layout.addWidget(self.git_refresh)
+        git_layout.addWidget(self.git_status, 1)
+        self.sidebar_views.addTab(git_page, "Git")
+        side_layout.addWidget(self.sidebar_views, 3)
+
+        # Lower utility area remains visible whichever primary view is selected.
+        self.utility_tabs = QTabWidget()
+        self.utility_tabs.setDocumentMode(True)
+        self.utility_tabs.setMinimumHeight(115)
+        self.outline_list = QListWidget()
+        self.outline_list.setToolTip("Functions and classes in the active Python file")
+        self.utility_tabs.addTab(self.outline_list, "Outline")
+        self.environment_list = QListWidget()
+        self.utility_tabs.addTab(self.environment_list, "Python Env")
+        side_layout.addWidget(self.utility_tabs, 2)
+        self.workspace.addWidget(self.sidebar)
+
+        # One width animation drives the splitter. No opacity effect: re-rendering the
+        # whole sidebar offscreen every frame is what made the old animation stutter.
+        self._sidebar_width_animation = QVariantAnimation(self)
+        self._sidebar_width_animation.valueChanged.connect(self._set_sidebar_animated_width)
+        self._sidebar_width_animation.finished.connect(self._finish_sidebar_animation)
+        self._sidebar_is_open = False
+        self._sidebar_target_width = SIDEBAR_WIDTH
+        self.sidebar.hide()
+
         self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.setStyleSheet("QSplitter::handle { background-color: rgba(255,255,255,0.08); }")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(1)
+        self.splitter.setStyleSheet("QSplitter::handle { background-color: rgba(255,255,255,0.10); }")
         self.stack = QStackedWidget()
         self.output = OutputConsole()
-        self.output.hide()
+        self.problems = QPlainTextEdit()
+        self.problems.setReadOnly(True)
+        self.problems.setUndoRedoEnabled(False)
+        self.problems.setFont(QFont(CODE_FONT, 10))
+        self.problems.setPlaceholderText("No problems detected.")
+        self.problems.setStyleSheet("""
+            QPlainTextEdit { background: rgba(0,0,0,0.14); color: #CBD5E1; border: none;
+                padding: 8px; selection-background-color: rgba(125,211,252,0.25); }
+        """)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+        self.bottom_tabs.addTab(self.output, "Output")
+        self.bottom_tabs.addTab(self.problems, "Problems")
+        self.bottom_tabs.setStyleSheet("""
+            QTabWidget::pane { background: rgba(0,0,0,0.15); border: none;
+                border-top: 1px solid rgba(255,255,255,0.10); }
+            QTabBar { background: rgba(5,10,20,0.20); }
+            QTabBar::tab { background: transparent; color: #94A3B8; border: none;
+                padding: 7px 14px; margin-right: 2px; font-size: 11px; }
+            QTabBar::tab:selected { color: #E2E8F0; background: rgba(203,213,225,0.10);
+                border-bottom: 2px solid #B8C2D0; }
+            QTabBar::tab:hover:!selected { color: #E2E8F0; }
+        """)
+        self.bottom_tabs.setMinimumHeight(110)
+        self.bottom_tabs.hide()
         self.splitter.addWidget(self.stack)
-        self.splitter.addWidget(self.output)
-        self.splitter.setStretchFactor(0, 3)
+        self.splitter.addWidget(self.bottom_tabs)
+        self.splitter.setStretchFactor(0, 4)
         self.splitter.setStretchFactor(1, 1)
-        main_layout.addWidget(self.splitter, 1)
+        self.workspace.addWidget(self.splitter)
+        self.workspace.setStretchFactor(0, 0)
+        self.workspace.setStretchFactor(1, 1)
+        self.workspace.setSizes([0, 1100])
+        main_layout.addWidget(self.workspace, 1)
 
         self.status = QLabel("")
         main_layout.addWidget(self.status)
         self._style_status("#94A3B8")
+        # Start with an empty Explorer instead of listing the process working
+        # directory (which may be a Python install or Windows system folder).
 
     def _style_status(self, color):
         self.status.setStyleSheet(
@@ -1346,17 +1661,264 @@ class MainWindow(QMainWindow):
 
     def _wire_signals(self):
         t = self.titlebar
-        t.btn_app_icon.clicked.connect(self._show_menu)
+        t.btn_app_icon.clicked.connect(self._toggle_explorer)
+        t.btn_app_icon.customContextMenuRequested.connect(self._show_menu_at_icon)
         t.btn_min.clicked.connect(self.showMinimized)
         t.btn_max.clicked.connect(self._toggle_maximize)
         t.btn_close.clicked.connect(self.close)
         self.tabbar.tabCloseRequested.connect(self.close_tab)
         self.tabbar.currentChanged.connect(self._on_tab_changed)
         self.output.submitted.connect(self._send_input)
+        self.btn_open_folder.clicked.connect(self._choose_project_folder)
+        self.file_tree.doubleClicked.connect(self._on_file_tree_double_clicked)
+        self.bottom_tabs.currentChanged.connect(lambda _: self.bottom_tabs.update())
+        self.search_input.returnPressed.connect(self._search_project)
+        self.search_results.itemDoubleClicked.connect(self._open_search_result)
+        self.git_refresh.clicked.connect(self._refresh_git_status)
+        self.outline_list.itemDoubleClicked.connect(self._jump_to_outline_item)
+        self.sidebar_views.currentChanged.connect(self._sidebar_view_changed)
+        self.workspace.splitterMoved.connect(self._on_workspace_moved)
+        self.utility_tabs.currentChanged.connect(lambda _: self.utility_tabs.update())
+        self._refresh_environment()
+        self.shortcut_sidebar_previous = QShortcut(QKeySequence("Shift+A"), self)
+        self.shortcut_sidebar_previous.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.shortcut_sidebar_previous.activated.connect(lambda: self._cycle_sidebar_view(-1))
+        self.shortcut_sidebar_next = QShortcut(QKeySequence("Shift+D"), self)
+        self.shortcut_sidebar_next.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.shortcut_sidebar_next.activated.connect(lambda: self._cycle_sidebar_view(1))
 
-    def _show_menu(self):
+        # Ctrl+Tab toggles the sidebar without stealing plain Tab from the editor,
+        # where it is used for indentation and accepting autocomplete suggestions.
+        self.shortcut_toggle_sidebar = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self.shortcut_toggle_sidebar.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.shortcut_toggle_sidebar.activated.connect(self._toggle_explorer)
+
+    def _sidebar_view_changed(self, index):
+        """Refresh view-specific data on demand without slowing the editor."""
+        if index == 2:
+            self._refresh_git_status()
+        elif index == 1:
+            query = self.search_input.text().strip()
+            if query and self._last_search != (str(self.project_root), query):
+                self._search_project()
+
+    def _cycle_sidebar_view(self, delta):
+        count = self.sidebar_views.count()
+        self.sidebar_views.setCurrentIndex((self.sidebar_views.currentIndex() + delta) % count)
+        if not self._sidebar_is_open:
+            self._toggle_explorer()
+        # Keep keyboard navigation useful even when the panel was closed.
+
+    def _refresh_environment(self):
+        py = find_python()
+        self.environment_list.clear()
+        self.environment_list.addItem("Python " + sys.version.split()[0])
+        self.environment_list.addItem(Path(py).name if py else "python (not found on PATH)")
+        self.environment_list.addItem("Interpreter:")
+        self.environment_list.addItem(py or "Install Python and tick 'Add to PATH'")
+        self.environment_list.addItem("Packages: use pip in the terminal")
+        self.environment_list.setToolTip(py or "")
+
+    def _refresh_outline(self):
+        editor = self.current_editor()
+        if not editor:
+            rows = (("No active file", None),)
+        else:
+            tree, err = editor.parse_tree()          # cached: no second parse
+            if tree is None:
+                line = err.lineno if isinstance(err, SyntaxError) else None
+                rows = ((f"Syntax error near line {line or '?'}", None),)
+            else:
+                entries = []
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        kind = ("class" if isinstance(node, ast.ClassDef)
+                                else "async def" if isinstance(node, ast.AsyncFunctionDef) else "def")
+                        entries.append((getattr(node, "lineno", 1), kind, node.name))
+                rows = tuple((f"{kind}  {name}  ·  L{line}", line) for line, kind, name in sorted(entries))
+                rows = rows or (("No classes or functions", None),)
+
+        key = (editor.uid if editor else None, rows)
+        if key == self._outline_key:                 # unchanged -> don't rebuild (no flicker / lost scroll)
+            return
+        self._outline_key = key
+        self.outline_list.clear()
+        for text, line in rows:
+            item = QListWidgetItem(text)
+            if line:
+                item.setData(Qt.ItemDataRole.UserRole, line)
+            self.outline_list.addItem(item)
+
+    def _goto_line(self, editor, line):
+        block = editor.document().findBlockByNumber(max(0, int(line) - 1))
+        if block.isValid():
+            editor.setTextCursor(QTextCursor(block))
+            editor.centerCursor()
+        editor.setFocus()
+
+    def _jump_to_outline_item(self, item):
+        line = item.data(Qt.ItemDataRole.UserRole)
+        editor = self.current_editor()
+        if editor and line:
+            self._goto_line(editor, line)
+
+    def _search_project(self):
+        self.search_results.clear()
+        if not self.project_root:
+            self.search_results.addItem("Open a project folder first.")
+            return
+        needle = self.search_input.text().strip()
+        if not needle:
+            return
+        self._last_search = (str(self.project_root), needle)
+        needle_cf = needle.casefold()
+        ignored = {".git", ".venv", "venv", "__pycache__", "node_modules", "dist", "build"}
+        exts = {".py", ".pyw", ".txt", ".md", ".json", ".toml", ".ini", ".yml", ".yaml",
+                ".qss", ".css", ".html", ".js", ".ts", ".rs", ".c", ".h"}
+        max_results = 500
+        count = 0
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.search_results.setUpdatesEnabled(False)
+        try:
+            for root, dirs, files in os.walk(self.project_root):
+                dirs[:] = [d for d in dirs if d not in ignored]
+                for name in files:
+                    path = Path(root) / name
+                    if path.suffix.lower() not in exts:
+                        continue
+                    try:
+                        if path.stat().st_size > 1_000_000:
+                            continue
+                        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    except (OSError, UnicodeError):
+                        continue
+                    for number, line in enumerate(lines, 1):
+                        if needle_cf in line.casefold():
+                            item = QListWidgetItem(f"{path.relative_to(self.project_root)}:{number}  {line.strip()[:140]}")
+                            item.setData(Qt.ItemDataRole.UserRole, (str(path), number))
+                            self.search_results.addItem(item)
+                            count += 1
+                            if count >= max_results:
+                                self.search_results.addItem("Result limit reached (500). Refine your search.")
+                                return
+            if not count:
+                self.search_results.addItem("No matches found.")
+        except OSError as exc:
+            self.search_results.addItem(f"Search failed: {exc}")
+        finally:
+            self.search_results.setUpdatesEnabled(True)
+            QApplication.restoreOverrideCursor()
+
+    def _open_search_result(self, item):
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        path, line = data
+        self.open_file_path(Path(path))
+        editor = self.current_editor()
+        if editor:
+            self._goto_line(editor, line)
+
+    # Git runs through QProcess so a slow repo can never freeze the UI.
+    def _refresh_git_status(self):
+        self.git_status.clear()
+        old, self._git_proc = self._git_proc, None
+        if old is not None:
+            try:
+                old.kill()
+            except RuntimeError:
+                pass
+        if not self.project_root:
+            self.git_status.addItem("Open a project folder first.")
+            return
+        self.git_status.addItem("Checking Git status…")
+        proc = QProcess(self)
+        self._git_proc = proc
+        proc.setProgram("git")
+        proc.setArguments(["-C", str(self.project_root), "status", "--short", "--branch"])
+        proc.finished.connect(lambda code, _status, p=proc: self._git_finished(p, code))
+        proc.errorOccurred.connect(lambda err, p=proc: self._git_error(p, err))
+        proc.start()
+
+    def _git_finished(self, proc, code):
+        if proc is not self._git_proc:               # superseded by a newer refresh
+            proc.deleteLater()
+            return
+        self._git_proc = None
+        out = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        err = bytes(proc.readAllStandardError()).decode("utf-8", errors="replace")
+        proc.deleteLater()
+        self.git_status.clear()
+        if code != 0:
+            if "not a git repository" in err.lower():
+                self.git_status.addItem("This folder is not a Git repository.")
+                self.git_status.addItem("Run `git init` to start tracking it.")
+            else:
+                self.git_status.addItem((err or "Unable to read Git status.").strip())
+            return
+        lines = out.splitlines()
+        if not lines or (len(lines) == 1 and lines[0].startswith("##")):
+            lines.append("Working tree clean")
+        for line in lines:
+            self.git_status.addItem(line)
+
+    def _git_error(self, proc, error):
+        if proc is not self._git_proc or error != QProcess.ProcessError.FailedToStart:
+            return
+        self._git_proc = None
+        proc.deleteLater()
+        self.git_status.clear()
+        self.git_status.addItem("Git CLI not found.")
+        self.git_status.addItem("Install Git for Windows to enable this view.")
+
+    def _show_menu_at_icon(self, pos):
+        # Right-click the app icon for New/Open/Save/Run/Close commands.
         btn = self.titlebar.btn_app_icon
         self.menu.exec(btn.mapToGlobal(QPoint(0, btn.height() + 4)))
+
+    def _set_sidebar_animated_width(self, value):
+        """Resize the sidebar through the splitter so the editor moves with it."""
+        width = max(0, int(value))
+        total = max(1, self.workspace.width())
+        width = min(width, max(0, total - 200))
+        self.workspace.setSizes([width, max(1, total - width)])
+
+    def _finish_sidebar_animation(self):
+        host = self.sidebar
+        if self._sidebar_is_open:
+            host.set_animating(False)                # content follows the real width again
+            host.setMinimumWidth(SIDEBAR_MIN_WIDTH)
+            self._set_sidebar_animated_width(self._sidebar_target_width)
+        else:
+            fw = QApplication.focusWidget()
+            editor = self.current_editor()
+            if editor and fw is not None and host.isAncestorOf(fw):
+                editor.setFocus()                    # don't leave focus in a hidden panel
+            host.hide()
+            host.set_animating(False)
+            host.setMinimumWidth(0)
+            self.workspace.setSizes([0, max(1, self.workspace.width())])
+
+    def _on_workspace_moved(self, pos, index):
+        """Remember the width the user dragged the sidebar to."""
+        if (self._sidebar_is_open
+                and self._sidebar_width_animation.state() != QAbstractAnimation.State.Running
+                and self.sidebar.width() >= SIDEBAR_MIN_WIDTH):
+            self._sidebar_target_width = self.sidebar.width()
+
+    def _prewarm_sidebar(self):
+        """Polish and lay out the sidebar once while idle, so its first open
+        doesn't have to do all of that in the middle of the animation."""
+        try:
+            inner = self.sidebar_inner
+            if not self.sidebar.isVisible():
+                inner.resize(self._sidebar_target_width, max(300, self.workspace.height()))
+            for w in [inner] + inner.findChildren(QWidget):
+                w.ensurePolished()
+            if inner.layout() is not None:
+                inner.layout().activate()
+        except Exception:
+            pass
 
     def _toggle_maximize(self):
         if self.isMaximized():
@@ -1368,6 +1930,83 @@ class MainWindow(QMainWindow):
     def _on_syntax(self, editor, ok, msg):
         if editor is self.current_editor():
             self._refresh_status()
+            self._refresh_problems()
+            self._refresh_outline()
+
+    def _refresh_problems(self):
+        editor = self.current_editor()
+        if not editor:
+            text = "No editor is open."
+        else:
+            ok, message = editor.last_status
+            if ok:
+                text = "✓  No syntax errors detected in the active file."
+            else:
+                name = editor.path.name if editor.path else "Untitled.py"
+                text = f"●  {name}: {message}"
+        if self.problems.toPlainText() != text:      # avoid resetting the pane on every keystroke
+            self.problems.setPlainText(text)
+
+    def _animate_sidebar(self, start: int, end: int):
+        anim = self._sidebar_width_animation
+        anim.stop()
+        # a short remaining distance (reversing mid-flight) gets a proportionally short run
+        fraction = min(1.0, abs(end - start) / max(1, self._sidebar_target_width))
+        anim.setDuration(int(max(90, SIDEBAR_ANIM_MS * fraction)))
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setStartValue(int(start))
+        anim.setEndValue(int(end))
+        self._set_sidebar_animated_width(start)
+        anim.start()
+
+    def _toggle_explorer(self, checked=False):
+        """Toggle the Explorer from the titlebar app icon with a smooth slide."""
+        host = self.sidebar
+        self._sidebar_width_animation.stop()
+        # Continue from the current width so reversing mid-flight never snaps.
+        start = host.width() if host.isVisible() else 0
+
+        if self._sidebar_is_open:
+            if start <= 0:
+                start = self._sidebar_target_width
+            self._sidebar_is_open = False
+            host.setMinimumWidth(0)
+            host.set_animating(True, self._sidebar_target_width)
+            self._animate_sidebar(start, 0)
+            return
+
+        self._sidebar_is_open = True
+        host.setMinimumWidth(0)
+        host.setMaximumWidth(SIDEBAR_MAX_WIDTH)
+        host.set_animating(True, self._sidebar_target_width)
+        host.show()
+        self._animate_sidebar(start, self._sidebar_target_width)
+
+    def _choose_project_folder(self):
+        current = str(self.project_root) if getattr(self, "project_root", None) else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Open Project Folder", current)
+        if folder:
+            self.set_project_root(Path(folder))
+
+    def set_project_root(self, folder: Path):
+        folder = Path(folder).expanduser().resolve()
+        if not folder.is_dir():
+            return
+        self.project_root = folder
+        self._last_search = None
+        self.search_results.clear()
+        root_index = self.file_model.setRootPath(str(folder))
+        self.file_tree.setRootIndex(root_index)
+        self.file_tree.setToolTip(str(folder))
+        self.explorer_empty.hide()
+        self.file_tree.show()
+        if self.sidebar_views.currentIndex() == 2:
+            self._refresh_git_status()
+
+    def _on_file_tree_double_clicked(self, index):
+        path = Path(self.file_model.filePath(index))
+        if path.is_file():
+            self.open_file_path(path)
 
     def _refresh_status(self):
         ed = self.current_editor()
@@ -1399,6 +2038,8 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(ed)
             ed.setFocus()
         self._refresh_status()
+        self._refresh_problems()
+        self._refresh_outline()
 
     def new_tab(self, path: Path = None):
         editor = CodeEditor()
@@ -1409,7 +2050,11 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(editor)
 
         if path and path.exists():
-            editor.setPlainText(path.read_text(encoding="utf-8", errors="replace"))
+            try:
+                editor.setPlainText(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                glass_message(self, "Open failed", f"Could not read {path.name}.",
+                              [("OK", "ok", "primary")], hint=str(exc))
         editor.document().setModified(False)
         editor.document().modificationChanged.connect(lambda _, e=editor: self._update_tab_title(e))
         editor.syntax_changed.connect(lambda ok, msg, e=editor: self._on_syntax(e, ok, msg))
@@ -1478,10 +2123,15 @@ class MainWindow(QMainWindow):
         editor = editor or self.current_editor()
         if not editor:
             return False
-        fname, _ = QFileDialog.getSaveFileName(self, "Save File As", "", "Python Files (*.py);;All Files (*)")
+        start_dir = editor.path or ((self.project_root or Path.home()) / "Untitled.py")
+        fname, chosen = QFileDialog.getSaveFileName(self, "Save File As", str(start_dir),
+                                                    "Python Files (*.py);;All Files (*)")
         if not fname:
             return False
-        return self._write(editor, Path(fname))
+        path = Path(fname)
+        if not path.suffix and chosen.startswith("Python"):
+            path = path.with_suffix(".py")
+        return self._write(editor, path)
 
     def open_file_dialog(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Python Files (*.py);;All Files (*)")
@@ -1503,8 +2153,11 @@ class MainWindow(QMainWindow):
         self.stop_script(hide=False)
 
         python = find_python()
-        self.output.show()
-        self.splitter.setSizes([450, 200])
+        self.bottom_tabs.show()
+        self.bottom_tabs.setCurrentWidget(self.output)
+        available = max(300, self.splitter.height())
+        panel_height = min(190, max(120, available // 3))
+        self.splitter.setSizes([max(120, available - panel_height), panel_height])
         self.output.clear()
         if not python:
             self.output.write("Python was not found on PATH. Install Python and tick 'Add to PATH'.\n", "err")
@@ -1539,10 +2192,13 @@ class MainWindow(QMainWindow):
         proc.setArguments(args)
         proc.setWorkingDirectory(str(workdir))
         proc.setProcessEnvironment(env)
+        # incremental decoders: a multi-byte character split across two reads stays intact
+        dec_out = codecs.getincrementaldecoder("utf-8")("replace")
+        dec_err = codecs.getincrementaldecoder("utf-8")("replace")
         proc.readyReadStandardOutput.connect(
-            lambda: self.output.write(bytes(proc.readAllStandardOutput()).decode(errors="replace")))
+            lambda: self.output.write(dec_out.decode(bytes(proc.readAllStandardOutput()))))
         proc.readyReadStandardError.connect(
-            lambda: self.output.write(bytes(proc.readAllStandardError()).decode(errors="replace"), "err"))
+            lambda: self.output.write(dec_err.decode(bytes(proc.readAllStandardError())), "err"))
         proc.finished.connect(lambda code, _: self._on_finished(proc, code))
         proc.start()
 
@@ -1570,7 +2226,18 @@ class MainWindow(QMainWindow):
             proc.waitForFinished(500)
         self._cleanup_tmp()
         if hide:
-            self.output.hide()
+            self.bottom_tabs.hide()
+
+    def keyPressEvent(self, event):
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ShiftModifier and not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)):
+            if event.key() == Qt.Key.Key_A:
+                self._cycle_sidebar_view(-1)
+                return
+            if event.key() == Qt.Key.Key_D:
+                self._cycle_sidebar_view(1)
+                return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event):
         # ask about every modified tab before the window goes away
@@ -1586,17 +2253,22 @@ class MainWindow(QMainWindow):
     # ---- painting
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         radius = 0 if self.isMaximized() else WINDOW_RADIUS
+        r = event.rect()
 
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
-        painter.setClipPath(path)
+        # The anti-aliased rounded clip only matters where the dirty area touches a
+        # corner; skipping it elsewhere makes the frequent interior repaints cheap.
+        if radius and (r.left() < radius or r.top() < radius
+                       or r.right() >= w - radius or r.bottom() >= h - radius):
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
+            painter.setClipPath(path)
 
         # translucent tint over the blurred backdrop (alpha must stay > 0,
         # fully transparent pixels become click-through on Windows)
-        painter.fillRect(self.rect(), WORKSPACE_TINT)
+        painter.fillRect(r, WORKSPACE_TINT)
 
         # solid platinum titlebar
         painter.fillRect(0, 0, w, TITLEBAR_HEIGHT, PLATINUM_SILVER)
@@ -1682,7 +2354,17 @@ class MainWindow(QMainWindow):
 
 def main():
     global CODE_FONT
+    # Prefer crisp UI text and high-DPI pixmaps without changing the app layout.
+    try:                                   # always on in Qt 6; the attribute may be gone entirely
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
     app = QApplication(sys.argv)
+    ui_font = QFont("Segoe UI", 10)
+    ui_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    app.setFont(ui_font)
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName("Wiper")
     CODE_FONT = load_fonts()
     initial = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     window = MainWindow(initial)
